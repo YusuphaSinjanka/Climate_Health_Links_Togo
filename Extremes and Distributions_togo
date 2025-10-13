@@ -1,0 +1,233 @@
+# ======================================================================
+# 03_distributions_and_extremes.R
+# Value distributions by period + extreme-events maps (MRI vs MPI)
+# ======================================================================
+
+# --------------------- SETTINGS YOU CAN CHANGE -------------------------
+# For DISTRIBUTIONS (annual statewide means):
+var_dist <- "tasmax"   # "tas", "pr", "tasmin", "tasmax"
+
+# For EXTREMES:
+# temperature extremes are computed from tasmax (avg #days/yr > thr_temp)
+ext_from_temp_var <- "tasmax"  # must exist in your proc/ folder
+thr_temp          <- 35        # °C threshold for hot days
+
+# precipitation extremes (avg #days/yr >= thr_pr)
+ext_from_pr_var <- "pr"
+thr_pr          <- 10          # mm/day threshold for "wet days"
+
+# Slices (order shown on plots)
+slices <- c("baseline_1991_2020",
+            "ssp245_2021_2040","ssp245_2041_2060","ssp245_2081_2100",
+            "ssp585_2021_2040","ssp585_2041_2060","ssp585_2081_2100")
+
+# Output folders
+out_dist    <- file.path("outputs","distributions"); dir.create(out_dist, recursive=TRUE, showWarnings=FALSE)
+out_extreme <- file.path("outputs","extremes");      dir.create(out_extreme, recursive=TRUE, showWarnings=FALSE)
+
+# ----------------------------------------------------------------------
+# PACKAGES
+pkgs <- c("terra","sf","dplyr","data.table","stringr","purrr","tibble",
+          "ggplot2","RColorBrewer","glue","patchwork")
+invisible(lapply(setdiff(pkgs, rownames(installed.packages())), install.packages))
+invisible(lapply(pkgs, library, character.only=TRUE))
+
+# ----------------------------------------------------------------------
+# SHAPES (auto-download once)
+dir_shapes <- file.path("data","shapes"); dir.create(dir_shapes, recursive=TRUE, showWarnings=FALSE)
+shp_country_path <- file.path(dir_shapes,"togo_country.gpkg")
+shp_regions_path <- file.path(dir_shapes,"togo_regions.gpkg")
+
+if (!file.exists(shp_country_path) || !file.exists(shp_regions_path)) {
+  if (!requireNamespace("geodata", quietly=TRUE)) install.packages("geodata")
+  tg0 <- geodata::gadm("TGO", level=0, path=tempdir()) |> sf::st_as_sf()
+  tg1 <- geodata::gadm("TGO", level=1, path=tempdir()) |> sf::st_as_sf() |>
+    dplyr::mutate(region = stringr::str_to_title(dplyr::coalesce(.data$NAME_1, .data$NAME_0))) |>
+    dplyr::mutate(region = dplyr::case_when(
+      stringr::str_detect(region,"Savan") ~ "Savanes",
+      stringr::str_detect(region,"Kara") ~ "Kara",
+      stringr::str_detect(region,"Centr") ~ "Centrale",
+      stringr::str_detect(region,"Plate") ~ "Plateaux",
+      stringr::str_detect(region,"Marit") ~ "Maritime",
+      TRUE ~ region))
+  sf::st_write(tg0, shp_country_path, delete_dsn=TRUE, quiet=TRUE)
+  sf::st_write(tg1, shp_regions_path, delete_dsn=TRUE, quiet=TRUE)
+}
+togo_country <- sf::st_read(shp_country_path, quiet=TRUE) |> sf::st_make_valid()
+togo_regions <- sf::st_read(shp_regions_path, quiet=TRUE) |> sf::st_make_valid()
+togo_state   <- sf::st_union(togo_country)
+
+# ----------------------------------------------------------------------
+# FILE DISCOVERY + IO HELPERS
+proj_root <- getwd()
+proc_root <- file.path(dirname(proj_root), "proc")
+
+discover_files <- function(var){
+  list(
+    MRI = list.files(file.path(proc_root, var, "MRI-ESM2-0","final"), pattern="\\.nc$", full.names=TRUE),
+    MPI = list.files(file.path(proc_root, var, "MPI-ESM1-2-HR","final"), pattern="\\.nc$", full.names=TRUE)
+  )
+}
+slice_from_name <- function(x){
+  m <- stringr::str_match(basename(x),
+                          ".*?(baseline_1991_2020|ssp245_\\d{4}_\\d{4}|ssp585_\\d{4}_\\d{4})")
+  m[,2]
+}
+read_slice <- function(files_vec, slice){
+  f <- files_vec[slice_from_name(files_vec) == slice]
+  if (length(f) != 1) stop(glue("Slice '{slice}' not found or not unique."))
+  terra::rast(f)
+}
+
+# Template grid to keep alignment tidy (matches your processing bbox/resolution)
+template <- terra::rast(extent = terra::ext(-1, 3, 5.5, 11.5),
+                        resolution = 0.25, crs = "EPSG:4326")
+to_template <- function(r, method="bilinear"){
+  r2 <- terra::resample(r, template, method=method)
+  terra::crop(r2, template)
+}
+
+# ----------------------------------------------------------------------
+# ANALYTIC HELPERS
+agg_yearly <- function(r) terra::tapp(r, format(terra::time(r), "%Y"), fun="mean", na.rm=TRUE)
+
+area_weight_statewide <- function(r){
+  # exact=TRUE uses polygon coverage to weight cells
+  df <- terra::extract(r, terra::vect(togo_state), fun=mean, na.rm=TRUE, exact=TRUE)
+  as.numeric(df[1,-1, drop=TRUE])
+}
+
+# For extremes: average number of days per year above/below threshold
+extreme_days_map <- function(r, thr, op = c("gt","ge")){
+  op <- match.arg(op)
+  bin <- if (op=="gt") r >  thr else r >= thr
+  idxY <- format(terra::time(r), "%Y")
+  yr_counts <- terra::tapp(bin, idxY, fun="sum", na.rm=TRUE)
+  terra::app(yr_counts, mean, na.rm=TRUE)  # mean days/yr across the slice
+}
+
+# ----------------------------------------------------------------------
+# PLOTTING HELPERS
+pal_temp_seq <- function(n=9)  RColorBrewer::brewer.pal(n,"YlOrRd")
+pal_pr_seq   <- function(n=9)  RColorBrewer::brewer.pal(n,"YlGnBu")
+
+# Distributions: violin + box, one panel per MODEL (MRI/MPI), single legend
+plot_distributions <- function(tbl, var_label){
+  tbl$slice  <- factor(tbl$slice, levels=slices)
+  cols <- RColorBrewer::brewer.pal(7, "Set2")
+  ggplot(tbl, aes(slice, value, fill=slice)) +
+    geom_violin(trim=FALSE, colour="grey30", alpha=.65) +
+    geom_boxplot(width=.12, fill="white", colour="grey20", outlier.size=.7) +
+    scale_fill_manual(values = cols) +
+    labs(x=NULL, y=var_label) +
+    facet_wrap(~model, ncol=2) +
+    theme_minimal(base_size=12) +
+    theme(panel.grid.minor = element_blank(),
+          axis.text.x = element_text(angle=20, hjust=1),
+          legend.position = "bottom")
+}
+
+# Maps: single raster → ggplot
+plot_raster_single <- function(r, title="", palette="temp", units_label=""){
+  rm <- terra::mask(r, terra::vect(togo_country), touches=TRUE)
+  df <- as.data.frame(rm, xy=TRUE, na.rm=TRUE); names(df)[3] <- "val"
+  pal <- if (palette=="pr") pal_pr_seq(9) else pal_temp_seq(9)
+  
+  ggplot() +
+    geom_raster(data=df, aes(x, y, fill=val)) +
+    scale_fill_gradientn(colours=pal, name=units_label) +
+    geom_sf(data=togo_country, fill=NA, colour="grey10", linewidth=0.6) +
+    geom_sf(data=togo_regions, fill=NA, colour="grey40", linewidth=0.3) +
+    coord_sf(xlim=sf::st_bbox(togo_country)[c("xmin","xmax")],
+             ylim=sf::st_bbox(togo_country)[c("ymin","ymax")],
+             expand=FALSE) +
+    labs(title=title, x=NULL, y=NULL) +
+    theme_minimal(base_size=12) +
+    theme(panel.grid = element_blank(),
+          legend.position = "right")
+}
+
+# Save helper
+save_png <- function(plot, path, w=10, h=7, dpi=450) {
+  ggplot2::ggsave(path, plot, width=w, height=h, dpi=dpi, bg="white")
+}
+
+# ======================================================================
+# 1) VALUE DISTRIBUTIONS BY PERIOD (statewide annual means)
+# ======================================================================
+message("Distributions → ", var_dist)
+
+files_dist <- discover_files(var_dist)
+
+dist_tbl <- purrr::map_dfr(c("MRI","MPI"), function(MOD){
+  purrr::map_dfr(slices, function(sl){
+    r <- read_slice(files_dist[[MOD]], sl) |> to_template("bilinear")
+    ry <- agg_yearly(r)                         # yearly mean rasters
+    vals <- area_weight_statewide(ry)           # statewide annual means
+    tibble(model = MOD, slice = sl, value = as.numeric(vals))
+  })
+})
+
+ylab_dist <- if (var_dist=="pr") "Annual mean (mm/day)" else "Annual mean (°C)"
+p_dist <- plot_distributions(dist_tbl, ylab_dist)
+save_png(p_dist, file.path(out_dist, glue("{var_dist}_annual_means_distributions_by_model.png")),
+         w=12, h=8)
+
+# ======================================================================
+# 2) EXTREME EVENTS MAPS (avg #days/year above threshold)
+#    - Temperature from tasmax > thr_temp
+#    - Precipitation from pr >= thr_pr
+# ======================================================================
+
+# ---- TEMPERATURE EXTREMES (tasmax > thr_temp) ----
+message("Extremes (temperature) → ", ext_from_temp_var, " > ", thr_temp, "°C")
+files_tmax <- discover_files(ext_from_temp_var)
+
+for (sl in slices){
+  r_mri <- read_slice(files_tmax$MRI, sl) |> to_template("bilinear")
+  r_mpi <- read_slice(files_tmax$MPI, sl) |> to_template("bilinear")
+  
+  ex_mri <- extreme_days_map(r_mri, thr=thr_temp, op="gt")
+  ex_mpi <- extreme_days_map(r_mpi, thr=thr_temp, op="gt")
+  
+  p1 <- plot_raster_single(ex_mri, title = glue("MRI | {sl}"),
+                           palette="temp", units_label = "days/yr")
+  p2 <- plot_raster_single(ex_mpi, title = glue("MPI | {sl}"),
+                           palette="temp", units_label = "days/yr")
+  
+  # pair with shared legend
+  p_pair <- (p1 + p2) + patchwork::plot_layout(guides = "collect") &
+    theme(legend.position = "right") &
+    ggtitle(glue("Hot days > {thr_temp}°C | Average number per year | {sl}"))
+  
+  save_png(p_pair, file.path(out_extreme, glue("tasmax_days_gt{thr_temp}_{sl}_MRI_MPI.png")),
+           w=12, h=9)
+}
+
+# ---- PRECIPITATION EXTREMES (pr >= thr_pr mm/day) ----
+message("Extremes (precip) → ", ext_from_pr_var, " ≥ ", thr_pr, " mm/day")
+files_pr <- discover_files(ext_from_pr_var)
+
+for (sl in slices){
+  r_mri <- read_slice(files_pr$MRI, sl) |> to_template("bilinear")
+  r_mpi <- read_slice(files_pr$MPI, sl) |> to_template("bilinear")
+  
+  ex_mri <- extreme_days_map(r_mri, thr=thr_pr, op="ge")
+  ex_mpi <- extreme_days_map(r_mpi, thr=thr_pr, op="ge")
+  
+  p1 <- plot_raster_single(ex_mri, title = glue("MRI | {sl}"),
+                           palette="pr", units_label = "days/yr")
+  p2 <- plot_raster_single(ex_mpi, title = glue("MPI | {sl}"),
+                           palette="pr", units_label = "days/yr")
+  
+  p_pair <- (p1 + p2) + patchwork::plot_layout(guides = "collect") &
+    theme(legend.position = "right") &
+    ggtitle(glue("Wet days ≥ {thr_pr} mm/day | Average number per year | {sl}"))
+  
+  save_png(p_pair, file.path(out_extreme, glue("pr_days_ge{thr_pr}_{sl}_MRI_MPI.png")),
+           w=12, h=9)
+}
+
+message("Done: distributions saved to ", normalizePath(out_dist),
+        " | extremes saved to ", normalizePath(out_extreme))
+
