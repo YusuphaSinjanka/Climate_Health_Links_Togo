@@ -1,9 +1,8 @@
-# ======================================================================
 # 03_distributions_and_extremes.R
 # Value distributions by period + extreme-events maps (MRI vs MPI)
-# ======================================================================
 
-# --------------------- SETTINGS YOU CAN CHANGE -------------------------
+
+# SETTINGS (can be changed based on variable you are using)
 # For DISTRIBUTIONS (annual statewide means):
 var_dist <- "tasmax"   # "tas", "pr", "tasmin", "tasmax"
 
@@ -25,14 +24,12 @@ slices <- c("baseline_1991_2020",
 out_dist    <- file.path("outputs","distributions"); dir.create(out_dist, recursive=TRUE, showWarnings=FALSE)
 out_extreme <- file.path("outputs","extremes");      dir.create(out_extreme, recursive=TRUE, showWarnings=FALSE)
 
-# ----------------------------------------------------------------------
 # PACKAGES
 pkgs <- c("terra","sf","dplyr","data.table","stringr","purrr","tibble",
           "ggplot2","RColorBrewer","glue","patchwork")
 invisible(lapply(setdiff(pkgs, rownames(installed.packages())), install.packages))
 invisible(lapply(pkgs, library, character.only=TRUE))
 
-# ----------------------------------------------------------------------
 # SHAPES (auto-download once)
 dir_shapes <- file.path("data","shapes"); dir.create(dir_shapes, recursive=TRUE, showWarnings=FALSE)
 shp_country_path <- file.path(dir_shapes,"togo_country.gpkg")
@@ -57,7 +54,6 @@ togo_country <- sf::st_read(shp_country_path, quiet=TRUE) |> sf::st_make_valid()
 togo_regions <- sf::st_read(shp_regions_path, quiet=TRUE) |> sf::st_make_valid()
 togo_state   <- sf::st_union(togo_country)
 
-# ----------------------------------------------------------------------
 # FILE DISCOVERY + IO HELPERS
 proj_root <- getwd()
 proc_root <- file.path(dirname(proj_root), "proc")
@@ -87,7 +83,6 @@ to_template <- function(r, method="bilinear"){
   terra::crop(r2, template)
 }
 
-# ----------------------------------------------------------------------
 # ANALYTIC HELPERS
 agg_yearly <- function(r) terra::tapp(r, format(terra::time(r), "%Y"), fun="mean", na.rm=TRUE)
 
@@ -106,7 +101,6 @@ extreme_days_map <- function(r, thr, op = c("gt","ge")){
   terra::app(yr_counts, mean, na.rm=TRUE)  # mean days/yr across the slice
 }
 
-# ----------------------------------------------------------------------
 # PLOTTING HELPERS
 pal_temp_seq <- function(n=9)  RColorBrewer::brewer.pal(n,"YlOrRd")
 pal_pr_seq   <- function(n=9)  RColorBrewer::brewer.pal(n,"YlGnBu")
@@ -152,9 +146,8 @@ save_png <- function(plot, path, w=10, h=7, dpi=450) {
   ggplot2::ggsave(path, plot, width=w, height=h, dpi=dpi, bg="white")
 }
 
-# ======================================================================
 # 1) VALUE DISTRIBUTIONS BY PERIOD (statewide annual means)
-# ======================================================================
+
 message("Distributions → ", var_dist)
 
 files_dist <- discover_files(var_dist)
@@ -173,13 +166,11 @@ p_dist <- plot_distributions(dist_tbl, ylab_dist)
 save_png(p_dist, file.path(out_dist, glue("{var_dist}_annual_means_distributions_by_model.png")),
          w=12, h=8)
 
-# ======================================================================
 # 2) EXTREME EVENTS MAPS (avg #days/year above threshold)
-#    - Temperature from tasmax > thr_temp
-#    - Precipitation from pr >= thr_pr
-# ======================================================================
+#    Temperature from tasmax > thr_temp
+#    Precipitation from pr >= thr_pr
 
-# ---- TEMPERATURE EXTREMES (tasmax > thr_temp) ----
+TEMPERATURE EXTREMES (tasmax > thr_temp) 
 message("Extremes (temperature) → ", ext_from_temp_var, " > ", thr_temp, "°C")
 files_tmax <- discover_files(ext_from_temp_var)
 
@@ -204,7 +195,7 @@ for (sl in slices){
            w=12, h=9)
 }
 
-# ---- PRECIPITATION EXTREMES (pr >= thr_pr mm/day) ----
+# PRECIPITATION EXTREMES (pr >= thr_pr mm/day) 
 message("Extremes (precip) → ", ext_from_pr_var, " ≥ ", thr_pr, " mm/day")
 files_pr <- discover_files(ext_from_pr_var)
 
