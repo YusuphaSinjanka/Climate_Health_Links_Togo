@@ -1,0 +1,1165 @@
+packages <- c(
+  "ncdf4",        # for reading NetCDF files
+  "raster",       # for spatial raster operations  
+  "terra",        # modern replacement for raster
+  "sf",           # for spatial vector data
+  "ggplot2",      # for beautiful plots
+  "viridis",      # for color palettes
+  "dplyr",        # for data manipulation
+  "tidyr",        # for data reshaping
+  "lubridate",    # for date handling
+  "RColorBrewer", # for additional color palettes
+  "patchwork",    # for combining multiple plots
+  "scales"        # for plot scaling
+)
+
+# Install packages
+for(pkg in packages) {
+  if(!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# Set the path to processed files (Windows format)
+base_path <- "E:/Climate Health Links-Togo/processed"
+
+# Define file paths with full paths
+files <- list(
+  precipitation = file.path(base_path, "pr_full_mmday_0.1deg.nc"),
+  temperature = file.path(base_path, "tas_full_C_0.1deg.nc"), 
+  temp_max = file.path(base_path, "tasmax_full_C_0.1deg.nc"),
+  temp_min = file.path(base_path, "tasmin_full_C_0.1deg.nc")
+)
+)
+
+# Print the paths to verify they're correct
+cat("Looking for files at:\n")
+for(i in 1:length(files)) {
+  cat(names(files)[i], ":", files[[i]], "\n")
+}
+
+# Check if files exist
+for(i in 1:length(files)) {
+  if(!file.exists(files[[i]])) {
+    stop(paste("File not found:", files[[i]]))
+  } else {
+    cat("✓ Found:", files[[i]], "\n")
+  }
+}
+
+#STEP 3: EXAMINE FILE STRUCTURE AND METADATA
+
+# Function to examine NetCDF file structure
+examine_nc_file <- function(filepath) {
+  nc <- nc_open(filepath)
+  cat("\n=== FILE:", basename(filepath), "===\n")
+  
+  # Print dimensions
+  cat("Dimensions:\n")
+  for(dim_name in names(nc$dim)) {
+    dim_obj <- nc$dim[[dim_name]]
+    cat("  ", dim_name, ":", dim_obj$len, dim_obj$units, "\n")
+  }
+  
+  # Print variables
+  cat("Variables:\n")
+  for(var_name in names(nc$var)) {
+    var_obj <- nc$var[[var_name]]
+    cat("  ", var_name, ":", var_obj$longname, "(", var_obj$units, ")\n")
+  }
+  
+  nc_close(nc)
+}
+
+# Examine each file
+for(file in files) {
+  examine_nc_file(file)
+}
+
+
+# STEP 4: LOAD DATA INTO R
+
+# Function to load NetCDF data as a raster brick/stack
+load_climate_data <- function(filepath, var_name) {
+  cat("Loading", var_name, "from", basename(filepath), "\n")
+  
+  # Load as raster brick (all time steps)
+  r <- brick(filepath, varname = var_name)
+  
+  # Get time information
+  nc <- nc_open(filepath)
+  time_var <- ncvar_get(nc, "time")
+  time_units <- ncatt_get(nc, "time", "units")$value
+  
+  # Convert time to dates
+  time_origin <- as.Date("1949-12-01") # Based on your data
+  dates <- time_origin + time_var
+  
+  nc_close(nc)
+  
+  # Add dates as layer names
+  names(r) <- as.character(dates)
+  
+  return(r)
+}
+
+# Load all datasets
+cat("Loading climate datasets...\n")
+pr_data <- load_climate_data(files$precipitation, "pr")
+tas_data <- load_climate_data(files$temperature, "tas") 
+tasmax_data <- load_climate_data(files$temp_max, "tasmax")
+tasmin_data <- load_climate_data(files$temp_min, "tasmin")
+
+# STEP 5: DATA QUALITY CHECKS
+
+# Function to check data quality
+check_data_quality <- function(data, var_name, expected_units) {
+  cat("\n=== QUALITY CHECK:", var_name, "===\n")
+  
+  # Basic statistics
+  sample_layer <- data[[1]]
+  cat("Spatial extent:", as.character(extent(sample_layer)), "\n")
+  cat("Resolution:", res(sample_layer), "\n")
+  cat("Number of time steps:", nlayers(data), "\n")
+  
+  # Value ranges
+  min_val <- cellStats(sample_layer, min, na.rm = TRUE)
+  max_val <- cellStats(sample_layer, max, na.rm = TRUE)
+  mean_val <- cellStats(sample_layer, mean, na.rm = TRUE)
+  
+  cat("Sample values (first layer):\n")
+  cat("  Min:", round(min_val, 2), expected_units, "\n")
+  cat("  Max:", round(max_val, 2), expected_units, "\n") 
+  cat("  Mean:", round(mean_val, 2), expected_units, "\n")
+  
+  # Check for missing values
+  na_count <- cellStats(is.na(sample_layer), sum)
+  total_cells <- ncell(sample_layer)
+  cat("  Missing values:", na_count, "/", total_cells, 
+      "(", round(na_count/total_cells*100, 1), "%)\n")
+}
+
+# Run quality checks
+check_data_quality(pr_data, "Precipitation", "mm/day")
+check_data_quality(tas_data, "Mean Temperature", "°C")
+check_data_quality(tasmax_data, "Max Temperature", "°C")
+check_data_quality(tasmin_data, "Min Temperature", "°C")
+
+# STEP 6: PREPARE DATA FOR ANALYSIS
+
+# First, let's examine what the layer names actually look like
+cat("Examining layer names structure:\n")
+cat("PR data layer names (first 5):\n")
+print(names(pr_data)[1:5])
+cat("Total layers in PR data:", nlayers(pr_data), "\n")
+
+# Function to extract dates from NetCDF files properly
+extract_dates_from_nc <- function(filepath) {
+  nc <- nc_open(filepath)
+  
+  # Get time variable
+  time_var <- ncvar_get(nc, "time")
+  time_units <- ncatt_get(nc, "time", "units")$value
+  
+  cat("Time units from file:", time_units, "\n")
+  cat("First few time values:", head(time_var), "\n")
+  
+  # Parse the time origin from units string
+  # Usually something like "days since 1949-12-01 00:00:00"
+  if(grepl("days since", time_units)) {
+    origin_match <- regmatches(time_units, regexpr("\\d{4}-\\d{2}-\\d{2}", time_units))
+    time_origin <- as.Date(origin_match)
+    dates <- time_origin + time_var
+  } else {
+    stop("Unexpected time format in NetCDF file")
+  }
+  
+  nc_close(nc)
+  return(dates)
+}
+
+# Get date sequences for each dataset using the NetCDF files directly
+cat("Extracting dates from NetCDF files...\n")
+pr_dates <- extract_dates_from_nc(files$precipitation)
+tas_dates <- extract_dates_from_nc(files$temperature)
+tasmax_dates <- extract_dates_from_nc(files$temp_max)
+tasmin_dates <- extract_dates_from_nc(files$temp_min)
+
+# Check the date ranges
+cat("Date ranges:\n")
+cat("PR: from", as.character(min(pr_dates)), "to", as.character(max(pr_dates)), "\n")
+cat("TAS: from", as.character(min(tas_dates)), "to", as.character(max(tas_dates)), "\n")
+
+# Create time period labels for analysis
+create_time_periods <- function(dates) {
+  years <- year(dates)
+  
+  periods <- case_when(
+    years >= 1981 & years <= 2010 ~ "Historical (1981-2010)",
+    years >= 2011 & years <= 2040 ~ "Near Future (2011-2040)", 
+    years >= 2041 & years <= 2070 ~ "Mid Century (2041-2070)",
+    years >= 2071 & years <= 2100 ~ "Late Century (2071-2100)",
+    TRUE ~ "Other"
+  )
+  
+  return(periods)
+}
+
+# Add time period information
+pr_periods <- create_time_periods(pr_dates)
+tas_periods <- create_time_periods(tas_dates)
+
+cat("Time periods identified:\n")
+table(pr_periods) %>% print()
+
+# FAST TOGO CLIMATE ANALYSIS - OPTIMIZED FOR LARGE DATASETS
+# Focuses on seasonal means, annual means, and monthly cycle
+
+# Stop any running calculations first, then run this optimized version
+
+# FAST SEASONAL AND ANNUAL CALCULATION FUNCTION
+
+calc_climate_means_fast <- function(raster_data, dates, periods, var_name) {
+  cat("=== PROCESSING", toupper(var_name), "===\n")
+  
+  # Sample data strategically - every 15th day to capture seasonal patterns
+  # This reduces computation by 93% while preserving climate patterns
+  sample_idx <- seq(1, length(dates), by = 15)
+  sample_data <- raster_data[[sample_idx]]
+  sample_dates <- dates[sample_idx]
+  sample_periods <- periods[sample_idx]
+  
+  cat("Original data points:", length(dates), "\n")
+  cat("Sampled data points:", length(sample_dates), "(", round(length(sample_dates)/length(dates)*100,1), "%)\n")
+  
+  # Add temporal information
+  months <- month(sample_dates)
+  years <- year(sample_dates)
+  seasons <- case_when(
+    months %in% c(12, 1, 2) ~ "DJF",
+    months %in% c(3, 4, 5) ~ "MAM", 
+    months %in% c(6, 7, 8) ~ "JJA",
+    months %in% c(9, 10, 11) ~ "SON"
+  )
+  
+  results <- list()
+  
+  # Calculate for each time period
+  unique_periods <- unique(sample_periods[sample_periods != "Other"])
+  
+  for(period in unique_periods) {
+    cat("Processing", period, "\n")
+    
+    period_idx <- which(sample_periods == period)
+    period_data <- sample_data[[period_idx]]
+    period_seasons <- seasons[period_idx]
+    period_months <- months[period_idx]
+    
+    # Annual mean
+    cat("  - Annual mean\n")
+    annual_mean <- calc(period_data, mean, na.rm = TRUE)
+    results[[paste(period, "Annual", sep = "_")]] <- annual_mean
+    
+    # Seasonal means
+    for(season in c("DJF", "MAM", "JJA", "SON")) {
+      season_idx <- which(period_seasons == season)
+      if(length(season_idx) > 5) {  # Need at least 5 data points
+        cat("  - Season", season, "\n")
+        season_mean <- calc(period_data[[season_idx]], mean, na.rm = TRUE)
+        results[[paste(period, season, sep = "_")]] <- season_mean
+      }
+    }
+    
+    # Monthly means (for annual cycle)
+    for(m in 1:12) {
+      month_idx <- which(period_months == m)
+      if(length(month_idx) > 2) {  # Need at least 2 data points
+        month_mean <- calc(period_data[[month_idx]], mean, na.rm = TRUE)
+        results[[paste(period, "Month", sprintf("%02d", m), sep = "_")]] <- month_mean
+      }
+    }
+  }
+  
+  cat("Completed", var_name, "- Generated", length(results), "maps\n\n")
+  return(results)
+}
+
+# PROCESS ALL VARIABLES QUICKLY
+
+cat("Starting fast climate analysis...\n")
+start_time <- Sys.time()
+
+# Process all variables
+pr_climate <- calc_climate_means_fast(pr_data, pr_dates, pr_periods, "Precipitation")
+tas_climate <- calc_climate_means_fast(tas_data, tas_dates, tas_periods, "Temperature")
+
+# Create the missing period variables for tasmax and tasmin
+tasmax_periods <- create_time_periods(tasmax_dates)
+tasmin_periods <- create_time_periods(tasmin_dates)
+
+# Now run the remaining climate calculations
+tasmax_climate <- calc_climate_means_fast(tasmax_data, tasmax_dates, tasmax_periods, "Max Temperature")
+tasmin_climate <- calc_climate_means_fast(tasmin_data, tasmin_dates, tasmin_periods, "Min Temperature")
+
+end_time <- Sys.time()
+cat("Total processing time:", round(difftime(end_time, start_time, units = "mins"), 1), "minutes\n\n")
+
+# ENHANCED PLOTTING FUNCTION
+
+# Function to create publication-quality maps
+create_climate_map <- function(raster_layer, title, units, color_palette = "viridis", 
+                               breaks = NULL, limits = NULL) {
+  
+  # Convert to dataframe
+  df <- as.data.frame(raster_layer, xy = TRUE)
+  colnames(df)[3] <- "value"
+  df <- df[!is.na(df$value), ]
+  
+  # Set up color scale
+  if(is.null(breaks)) {
+    scale_fill <- scale_fill_viridis_c(name = units, option = color_palette, 
+                                       limits = limits, na.value = "grey90")
+  } else {
+    scale_fill <- scale_fill_viridis_b(name = units, option = color_palette, 
+                                       breaks = breaks, limits = limits, na.value = "grey90")
+  }
+  
+  # Create plot
+  p <- ggplot(df, aes(x = x, y = y, fill = value)) +
+    geom_raster() +
+    scale_fill +
+    coord_fixed(ratio = 1) +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 11, face = "bold", margin = margin(b = 5)),
+      legend.position = "bottom",
+      legend.key.width = unit(1.2, "cm"),
+      legend.key.height = unit(0.3, "cm"),
+      legend.title = element_text(size = 9),
+      legend.text = element_text(size = 8),
+      panel.border = element_rect(color = "black", fill = NA, size = 0.3),
+      plot.margin = margin(5, 5, 5, 5)
+    ) +
+    labs(title = title) +
+    guides(fill = guide_colorbar(title.position = "top", title.hjust = 0.5))
+  
+  return(p)
+}
+
+# IMPROVED CLIMATE PLOTTING WITH PROPER FORMATTING AND BORDERS
+
+# First, let's check what the actual values look like
+cat("Checking precipitation values:\n")
+sample_pr <- pr_climate[[1]]
+if(!is.null(sample_pr)) {
+  pr_values <- values(sample_pr)
+  pr_values <- pr_values[!is.na(pr_values)]
+  cat("Min:", round(min(pr_values), 3), "mm/day\n")
+  cat("Max:", round(max(pr_values), 3), "mm/day\n")
+  cat("Mean:", round(mean(pr_values), 3), "mm/day\n")
+}
+
+# Install and load additional packages for country borders
+if(!require("rnaturalearth", quietly = TRUE)) {
+  install.packages("rnaturalearth")
+  library(rnaturalearth)
+}
+if(!require("rnaturalearthdata", quietly = TRUE)) {
+  install.packages("rnaturalearthdata")
+  library(rnaturalearthdata)
+}
+
+# Get Togo boundaries
+togo_boundary <- ne_countries(scale = "medium", country = "Togo", returnclass = "sf")
+
+# Improved plotting function with country boundaries
+create_improved_climate_map <- function(raster_layer, title, units, color_palette = "viridis", 
+                                        breaks = NULL, limits = NULL) {
+  
+  # Convert raster to dataframe
+  df <- as.data.frame(raster_layer, xy = TRUE)
+  colnames(df)[3] <- "value"
+  df <- df[!is.na(df$value), ]
+  
+  # Handle extreme values or unit conversion issues
+  if(units == "mm/day" && max(df$value, na.rm = TRUE) > 1000) {
+    cat("Warning: Large precipitation values detected, applying correction...\n")
+    df$value <- df$value / 86400  # Convert if values are still in kg/m2/s
+  }
+  
+  # Create sensible breaks and limits
+  if(is.null(breaks) && is.null(limits)) {
+    if(units == "mm/day") {
+      limits <- c(0, quantile(df$value, 0.95, na.rm = TRUE))
+      breaks <- seq(limits[1], limits[2], length.out = 6)
+    } else if(units == "°C") {
+      limits <- range(df$value, na.rm = TRUE)
+      breaks <- seq(limits[1], limits[2], length.out = 6)
+    }
+  }
+  
+  # Create base plot
+  p <- ggplot() +
+    geom_raster(data = df, aes(x = x, y = y, fill = value)) +
+    geom_sf(data = togo_boundary, fill = NA, color = "black", size = 0.8) +
+    scale_fill_viridis_c(
+      name = units, 
+      option = color_palette, 
+      limits = limits,
+      breaks = breaks,
+      labels = function(x) round(x, 2),
+      na.value = "grey90"
+    ) +
+    coord_sf(
+      xlim = c(-0.5, 2.1),
+      ylim = c(6.0, 11.1),
+      expand = FALSE
+    ) +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 11, face = "bold", margin = margin(b = 10)),
+      legend.position = "bottom",
+      legend.key.width = unit(1.5, "cm"),
+      legend.key.height = unit(0.4, "cm"),
+      legend.title = element_text(size = 9, face = "bold"),
+      legend.text = element_text(size = 8),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+      plot.margin = margin(10, 10, 10, 10),
+      axis.text = element_text(size = 8)
+    ) +
+    labs(title = title) +
+    guides(fill = guide_colorbar(
+      title.position = "top", 
+      title.hjust = 0.5,
+      label.position = "bottom",
+      nrow = 1
+    ))
+  
+  return(p)
+}
+
+# Create improved annual comparison function
+create_improved_annual_comparison <- function(climate_data, var_name, units, color_palette) {
+  
+  periods <- c("Historical (1981-2010)", "Near Future (2011-2040)", 
+               "Mid Century (2041-2070)", "Late Century (2071-2100)")
+  
+  plots <- list()
+  
+  # Calculate common scale limits across all periods
+  all_values <- c()
+  for(period in periods) {
+    data_key <- paste(period, "Annual", sep = "_")
+    if(data_key %in% names(climate_data)) {
+      vals <- values(climate_data[[data_key]])
+      vals <- vals[!is.na(vals)]
+      if(units == "mm/day" && max(vals, na.rm = TRUE) > 1000) {
+        vals <- vals / 86400  # Correct units if needed
+      }
+      all_values <- c(all_values, vals)
+    }
+  }
+  
+  # Set common limits
+  if(units == "mm/day") {
+    common_limits <- c(0, quantile(all_values, 0.95, na.rm = TRUE))
+  } else {
+    common_limits <- range(all_values, na.rm = TRUE)
+  }
+  
+  for(i in 1:length(periods)) {
+    period <- periods[i]
+    data_key <- paste(period, "Annual", sep = "_")
+    
+    if(data_key %in% names(climate_data)) {
+      period_short <- c("Historical\n(1981-2010)", "Near Future\n(2011-2040)", 
+                        "Mid-Century\n(2041-2070)", "Late Century\n(2071-2100)")[i]
+      
+      p <- create_improved_climate_map(
+        climate_data[[data_key]], 
+        period_short, 
+        units, 
+        color_palette,
+        limits = common_limits
+      )
+      plots[[i]] <- p
+    }
+  }
+  
+  # Combine plots with better spacing
+  combined <- wrap_plots(plots, ncol = 2, nrow = 2) + 
+    plot_annotation(
+      title = paste("Annual Mean", var_name, "- Togo Climate Projections (RCP8.5)"),
+      theme = theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold", margin = margin(b = 20)))
+    )
+  
+  return(combined)
+}
+
+# Create the improved plots
+cat("Creating improved precipitation plot...\n")
+p1_improved <- create_improved_annual_comparison(pr_climate, "Precipitation", "mm/day", "viridis")
+print(p1_improved)
+
+cat("Creating improved temperature plot...\n")
+p2_improved <- create_improved_annual_comparison(tas_climate, "Mean Temperature", "°C", "plasma")
+print(p2_improved)
+
+# Save the plots for better viewing
+ggsave("togo_precipitation_annual.png", p1_improved, width = 14, height = 10, dpi = 300, bg = "white")
+ggsave("togo_temperature_annual.png", p2_improved, width = 14, height = 10, dpi = 300, bg = "white")
+
+cat("Plots saved as PNG files in your working directory\n")
+
+# Also create a simple diagnostic plot to check data values
+create_value_diagnostic <- function(climate_data, var_name, units) {
+  
+  # Get all values from all periods
+  periods <- c("Historical (1981-2010)", "Near Future (2011-2040)", 
+               "Mid Century (2041-2070)", "Late Century (2071-2100)")
+  
+  df_list <- list()
+  
+  for(period in periods) {
+    data_key <- paste(period, "Annual", sep = "_")
+    if(data_key %in% names(climate_data)) {
+      vals <- values(climate_data[[data_key]])
+      vals <- vals[!is.na(vals)]
+      if(units == "mm/day" && max(vals, na.rm = TRUE) > 1000) {
+        vals <- vals / 86400
+      }
+      df_list[[period]] <- data.frame(
+        Period = period,
+        Values = vals
+      )
+    }
+  }
+  
+  df <- do.call(rbind, df_list)
+  
+  p <- ggplot(df, aes(x = Period, y = Values, fill = Period)) +
+    geom_boxplot(alpha = 0.7) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(
+      title = paste(var_name, "Value Distribution by Period"),
+      y = units,
+      x = "Time Period"
+    ) +
+    guides(fill = "none")
+  
+  return(p)
+}
+
+# Create diagnostic plots
+diag_pr <- create_value_diagnostic(pr_climate, "Precipitation", "mm/day")
+print(diag_pr)
+
+diag_temp <- create_value_diagnostic(tas_climate, "Temperature", "°C")
+print(diag_temp)
+
+# Test individual plots with legends first
+test_period <- names(pr_climate)[grepl("Annual", names(pr_climate))][1]
+test_plot <- create_improved_climate_map(
+  pr_climate[[test_period]], 
+  "Test - Precipitation", 
+  "mm/day", 
+  "viridis"
+)
+print(test_plot)
+
+# If the legend appears on this single plot, the issue is with the combined layout
+# Let's create a version with legends outside the combined plot
+create_plots_with_shared_legend <- function(climate_data, var_name, units, color_palette) {
+  
+  periods <- c("Historical (1981-2010)", "Near Future (2011-2040)", 
+               "Mid Century (2041-2070)", "Late Century (2071-2100)")
+  
+  # Get all values to create shared scale
+  all_values <- c()
+  for(period in periods) {
+    data_key <- paste(period, "Annual", sep = "_")
+    if(data_key %in% names(climate_data)) {
+      vals <- values(climate_data[[data_key]])
+      vals <- vals[!is.na(vals)]
+      if(units == "mm/day" && max(vals, na.rm = TRUE) > 1000) {
+        vals <- vals / 86400
+      }
+      all_values <- c(all_values, vals)
+    }
+  }
+  
+  if(units == "mm/day") {
+    common_limits <- c(0, quantile(all_values, 0.95, na.rm = TRUE))
+  } else {
+    common_limits <- range(all_values, na.rm = TRUE)
+  }
+  
+  # Create individual plots
+  plots <- list()
+  for(i in 1:length(periods)) {
+    period <- periods[i]
+    data_key <- paste(period, "Annual", sep = "_")
+    
+    if(data_key %in% names(climate_data)) {
+      period_short <- c("Historical", "Near Future", "Mid-Century", "Late Century")[i]
+      
+      p <- create_improved_climate_map(
+        climate_data[[data_key]], 
+        period_short, 
+        units, 
+        color_palette,
+        limits = common_limits
+      )
+      plots[[i]] <- p
+    }
+  }
+  
+  return(plots)
+}
+
+# Create individual plots
+pr_plots <- create_plots_with_shared_legend(pr_climate, "Precipitation", "mm/day", "viridis")
+
+# Display each plot individually to check legends
+for(i in 1:length(pr_plots)) {
+  if(!is.null(pr_plots[[i]])) {
+    print(pr_plots[[i]])
+  }
+}
+
+
+# First, let's check what's in each climate dataset
+cat("Checking climate data structure:\n")
+cat("PR climate maps:", length(pr_climate), "- Names:", names(pr_climate)[1:3], "\n")
+cat("TAS climate maps:", length(tas_climate), "- Names:", names(tas_climate)[1:3], "\n")
+
+# Check if temperature data has proper values
+test_temp_data <- tas_climate[[names(tas_climate)[1]]]
+temp_values <- values(test_temp_data)
+temp_values <- temp_values[!is.na(temp_values)]
+
+cat("Temperature value range:\n")
+cat("Min:", min(temp_values, na.rm = TRUE), "°C\n")
+cat("Max:", max(temp_values, na.rm = TRUE), "°C\n")
+cat("Mean:", mean(temp_values, na.rm = TRUE), "°C\n")
+cat("Any NAs:", any(is.na(temp_values)), "\n")
+
+# Test temperature plot individually
+test_temp_plot <- create_improved_climate_map(
+  test_temp_data, 
+  "Test - Temperature", 
+  "°C", 
+  "plasma"
+)
+print(test_temp_plot)
+
+# Fixed version - remove the problematic argument and use better layout
+create_annual_maps_with_legends <- function(climate_data, var_name, units, color_palette) {
+  
+  periods <- c("Historical (1981-2010)", "Near Future (2011-2040)", 
+               "Mid Century (2041-2070)", "Late Century (2071-2100)")
+  
+  # Get common scale
+  all_values <- c()
+  for(period in periods) {
+    data_key <- paste(period, "Annual", sep = "_")
+    if(data_key %in% names(climate_data)) {
+      vals <- values(climate_data[[data_key]])
+      vals <- vals[!is.na(vals)]
+      if(units == "mm/day" && max(vals, na.rm = TRUE) > 1000) {
+        vals <- vals / 86400
+      }
+      all_values <- c(all_values, vals)
+    }
+  }
+  
+  common_limits <- range(all_values, na.rm = TRUE)
+  if(units == "mm/day") common_limits[1] <- 0
+  
+  # Create individual plots with proper legends
+  plots <- list()
+  period_labels <- c("Historical\n(1981-2010)", "Near Future\n(2011-2040)", 
+                     "Mid-Century\n(2041-2070)", "Late Century\n(2071-2100)")
+  
+  for(i in 1:4) {
+    period <- periods[i]
+    data_key <- paste(period, "Annual", sep = "_")
+    
+    if(data_key %in% names(climate_data)) {
+      df <- as.data.frame(climate_data[[data_key]], xy = TRUE)
+      colnames(df)[3] <- "value"
+      df <- df[!is.na(df$value), ]
+      
+      # Apply corrections
+      if(units == "mm/day" && max(df$value, na.rm = TRUE) > 1000) {
+        df$value <- df$value / 86400
+      }
+      
+      p <- ggplot(df, aes(x = x, y = y, fill = value)) +
+        geom_raster() +
+        scale_fill_viridis_c(
+          name = units,
+          option = color_palette,
+          limits = common_limits,
+          na.value = "white"
+        ) +
+        coord_fixed(xlim = c(-0.5, 2.1), ylim = c(6, 11.1)) +
+        theme_void() +
+        theme(
+          plot.title = element_text(hjust = 0.5, size = 10, face = "bold"),
+          legend.position = "bottom",
+          legend.key.width = unit(1, "cm"),
+          legend.key.height = unit(0.3, "cm"),
+          legend.title = element_text(size = 8),
+          legend.text = element_text(size = 7),
+          panel.border = element_rect(color = "black", fill = NA, linewidth = 0.3),
+          plot.margin = margin(5, 5, 20, 5)  # Extra bottom margin for legend
+        ) +
+        labs(title = period_labels[i])
+      
+      plots[[i]] <- p
+    }
+  }
+  
+  # Combine with more space for legends
+  combined <- wrap_plots(plots, ncol = 2, nrow = 2) + 
+    plot_annotation(
+      title = paste("Annual Mean", var_name, "- Togo Climate Projections (RCP8.5)"),
+      theme = theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+    )
+  
+  return(combined)
+}
+
+# Create the fixed plots
+cat("Creating precipitation plot with proper legends...\n")
+pr_final <- create_annual_maps_with_legends(pr_climate, "Precipitation", "mm/day", "viridis")
+print(pr_final)
+
+cat("Creating temperature plot with proper legends...\n")
+temp_final <- create_annual_maps_with_legends(tas_climate, "Mean Temperature", "°C", "plasma")
+print(temp_final)
+
+# Save with better dimensions to accommodate legends
+ggsave("togo_precipitation_final.png", pr_final, width = 12, height = 10, dpi = 300, bg = "white")
+ggsave("togo_temperature_final.png", temp_final, width = 12, height = 10, dpi = 300, bg = "white")
+
+cat("Fixed plots saved! Each subplot should now have its own legend.\n")
+
+
+# Option 1: Open plots in a new graphics device window
+dev.new()  # Opens external plot window
+print(pr_final)
+
+# Option 2: Save plots as high-resolution files and view externally
+ggsave("temp_plot.png", pr_final, width = 16, height = 12, dpi = 300)
+# Then open the PNG file in your image viewer for zooming
+
+# Option 3: Create individual plots instead of combined ones
+# These should be more responsive for zooming
+individual_historical <- create_annual_maps_with_legends(pr_climate, "Historical Precipitation", "mm/day", "viridis")
+print(individual_historical[[1]])  # Just the historical period
+
+# Option 4: Use plotly for interactive plots (requires installation)
+if(!require("plotly")) install.packages("plotly")
+
+# Convert ggplot to interactive plotly (works best with single plots)
+interactive_plot <- ggplotly(pr_final)
+interactive_plot
+
+# Save high-resolution versions and view them externally
+ggsave("precipitation_detailed.png", pr_final, width = 20, height = 16, dpi = 400)
+ggsave("temperature_detailed.png", temp_final, width = 20, height = 16, dpi = 400)
+
+# Then open these files in Windows Photo Viewer or similar for smooth zooming
+
+# FIXED VERSION: PLOT 2 - SEASONAL MAPS WITH BOUNDARIES AND BETTER TEXT
+
+create_seasonal_maps_fixed <- function(climate_data, period, var_name, units, color_palette) {
+  
+  # Load Togo boundaries (if not already loaded)
+  if(!exists("togo_boundary")) {
+    if(!require("rnaturalearth", quietly = TRUE)) {
+      install.packages("rnaturalearth")
+      library(rnaturalearth)
+    }
+    togo_boundary <- ne_countries(scale = "medium", country = "Togo", returnclass = "sf")
+  }
+  
+  seasons <- c("DJF", "MAM", "JJA", "SON")
+  # Fixed: Shorter, non-overlapping season names
+  season_names <- c("Dec-Jan-Feb\n(Dry)", "Mar-Apr-May\n(Transition)", 
+                    "Jun-Jul-Aug\n(Wet)", "Sep-Oct-Nov\n(Transition)")
+  
+  # Get common scale for all seasons
+  all_season_values <- c()
+  for(season in seasons) {
+    data_key <- paste(period, season, sep = "_")
+    if(data_key %in% names(climate_data)) {
+      vals <- values(climate_data[[data_key]])
+      vals <- vals[!is.na(vals)]
+      if(units == "mm/day" && max(vals, na.rm = TRUE) > 1000) {
+        vals <- vals / 86400
+      }
+      all_season_values <- c(all_season_values, vals)
+    }
+  }
+  
+  if(length(all_season_values) == 0) {
+    cat("No seasonal data found for", period, "\n")
+    return(NULL)
+  }
+  
+  common_limits <- range(all_season_values, na.rm = TRUE)
+  if(units == "mm/day") common_limits[1] <- 0
+  
+  plots <- list()
+  
+  for(i in 1:4) {
+    season <- seasons[i]
+    data_key <- paste(period, season, sep = "_")
+    
+    if(data_key %in% names(climate_data)) {
+      df <- as.data.frame(climate_data[[data_key]], xy = TRUE)
+      colnames(df)[3] <- "value"
+      df <- df[!is.na(df$value), ]
+      
+      if(units == "mm/day" && max(df$value, na.rm = TRUE) > 1000) {
+        df$value <- df$value / 86400
+      }
+      
+      p <- ggplot() +
+        geom_raster(data = df, aes(x = x, y = y, fill = value)) +
+        # Add Togo boundaries
+        geom_sf(data = togo_boundary, fill = NA, color = "black", size = 0.8) +
+        scale_fill_viridis_c(
+          name = units,
+          option = color_palette,
+          limits = common_limits,
+          na.value = "white"
+        ) +
+        coord_sf(xlim = c(-0.5, 2.1), ylim = c(6, 11.1), expand = FALSE) +
+        theme_void() +
+        theme(
+          plot.title = element_text(hjust = 0.5, size = 9, face = "bold", 
+                                    margin = margin(b = 8)), # More space below title
+          legend.position = "bottom",
+          legend.key.width = unit(1, "cm"),
+          legend.key.height = unit(0.25, "cm"),
+          legend.title = element_text(size = 7),
+          legend.text = element_text(size = 6),
+          panel.border = element_rect(color = "black", fill = NA, linewidth = 0.3),
+          plot.margin = margin(8, 5, 18, 5)  # More space top and bottom
+        ) +
+        labs(title = season_names[i])
+      
+      plots[[i]] <- p
+    }
+  }
+  
+  # Combine seasonal plots with better spacing
+  combined <- wrap_plots(plots[!sapply(plots, is.null)], ncol = 2, nrow = 2) + 
+    plot_annotation(
+      title = paste(var_name, "Seasonal Patterns -", period),
+      theme = theme(
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold", 
+                                  margin = margin(b = 15))  # More space below main title
+      )
+    )
+  
+  return(combined)
+}
+
+# Create the fixed seasonal plots
+cat("Creating FIXED seasonal precipitation maps...\n")
+pr_seasonal_hist_fixed <- create_seasonal_maps_fixed(pr_climate, "Historical (1981-2010)", 
+                                                     "Precipitation", "mm/day", "viridis")
+if(!is.null(pr_seasonal_hist_fixed)) print(pr_seasonal_hist_fixed)
+
+
+pr_seasonal_future_fixed <- create_seasonal_maps_fixed(pr_climate, "Late Century (2071-2100)", 
+                                                       "Precipitation", "mm/day", "viridis")
+if(!is.null(pr_seasonal_future_fixed)) print(pr_seasonal_future_fixed)
+
+cat("Creating FIXED seasonal temperature maps...\n")
+temp_seasonal_hist_fixed <- create_seasonal_maps_fixed(tas_climate, "Historical (1981-2010)", 
+                                                       "Temperature", "°C", "plasma")
+if(!is.null(temp_seasonal_hist_fixed)) print(temp_seasonal_hist_fixed)
+
+temp_seasonal_future_fixed <- create_seasonal_maps_fixed(tas_climate, "Late Century (2071-2100)", 
+                                                         "Temperature", "°C", "plasma")
+if(!is.null(temp_seasonal_future_fixed)) print(temp_seasonal_future_fixed)
+
+# Save the fixed versions
+ggsave("togo_precipitation_seasonal_historical_FIXED.png", pr_seasonal_hist_fixed, 
+       width = 12, height = 9, dpi = 300, bg = "white")
+ggsave("togo_precipitation_seasonal_future_FIXED.png", pr_seasonal_future_fixed, 
+       width = 12, height = 9, dpi = 300, bg = "white")
+ggsave("togo_temperature_seasonal_historical_FIXED.png", temp_seasonal_hist_fixed, 
+       width = 12, height = 9, dpi = 300, bg = "white")
+ggsave("togo_temperature_seasonal_future_FIXED.png", temp_seasonal_future_fixed, 
+       width = 12, height = 9, dpi = 300, bg = "white")
+
+cat("Fixed seasonal plots saved with Togo boundaries and proper text spacing!\n")
+
+
+# PLOT 3: ANNUAL CYCLE (MONTHLY MEANS)
+
+create_monthly_cycle_comparison <- function(climate_data, var_name, units, periods_to_compare) {
+  
+  monthly_data_list <- list()
+  
+  for(period in periods_to_compare) {
+    monthly_values <- c()
+    
+    for(month in 1:12) {
+      data_key <- paste(period, "Month", sprintf("%02d", month), sep = "_")
+      if(data_key %in% names(climate_data)) {
+        # Calculate spatial average
+        month_avg <- cellStats(climate_data[[data_key]], mean, na.rm = TRUE)
+        if(units == "mm/day" && month_avg > 1000) {
+          month_avg <- month_avg / 86400
+        }
+        monthly_values[month] <- month_avg
+      } else {
+        monthly_values[month] <- NA
+      }
+    }
+    
+    if(any(!is.na(monthly_values))) {
+      monthly_data_list[[period]] <- data.frame(
+        Period = period,
+        Month = factor(month.name, levels = month.name),
+        Value = monthly_values
+      )
+    }
+  }
+  
+  if(length(monthly_data_list) == 0) {
+    cat("No monthly data found for", var_name, "\n")
+    return(NULL)
+  }
+  
+  # Combine data
+  df <- do.call(rbind, monthly_data_list)
+  df <- df[!is.na(df$Value), ]
+  
+  # Create the plot
+  p <- ggplot(df, aes(x = Month, y = Value, color = Period, group = Period)) +
+    geom_line(size = 1.2) +
+    geom_point(size = 2.5) +
+    scale_color_viridis_d(option = "plasma", begin = 0.2, end = 0.8) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+      legend.title = element_text(face = "bold"),
+      panel.grid.minor.x = element_blank(),
+      panel.grid.major.x = element_line(color = "grey90", size = 0.3)
+    ) +
+    labs(
+      title = paste("Annual Cycle:", var_name, "(Togo Average)"),
+      x = "Month",
+      y = paste("Mean", units),
+      color = "Time Period"
+    ) +
+    guides(color = guide_legend(override.aes = list(size = 3)))
+  
+  return(p)
+}
+
+# Create monthly cycle plots comparing historical vs future
+cat("Creating monthly cycle plots...\n")
+
+periods_to_compare <- c("Historical (1981-2010)", "Late Century (2071-2100)")
+
+pr_monthly <- create_monthly_cycle_comparison(pr_climate, "Precipitation", "mm/day", periods_to_compare)
+if(!is.null(pr_monthly)) print(pr_monthly)
+
+temp_monthly <- create_monthly_cycle_comparison(tas_climate, "Temperature", "°C", periods_to_compare)
+if(!is.null(temp_monthly)) print(temp_monthly)
+
+# Save all the new plots
+ggsave("togo_precipitation_seasonal_historical.png", pr_seasonal_hist, width = 12, height = 8, dpi = 300)
+ggsave("togo_precipitation_seasonal_future.png", pr_seasonal_future, width = 12, height = 8, dpi = 300)
+ggsave("togo_temperature_seasonal_historical.png", temp_seasonal_hist, width = 12, height = 8, dpi = 300)
+ggsave("togo_temperature_seasonal_future.png", temp_seasonal_future, width = 12, height = 8, dpi = 300)
+ggsave("togo_precipitation_monthly_cycle.png", pr_monthly, width = 10, height = 6, dpi = 300)
+ggsave("togo_temperature_monthly_cycle.png", temp_monthly, width = 10, height = 6, dpi = 300)
+
+cat("\n=== ALL PLOTS COMPLETE ===\n")
+cat("Created:\n")
+cat("✓ Annual mean maps (4 time periods)\n")
+cat("✓ Seasonal maps (Historical vs Future)\n") 
+cat("✓ Monthly cycle plots (annual patterns)\n")
+cat("✓ All plots saved as high-resolution PNG files\n")
+
+
+# ENHANCED ANNUAL CYCLE PLOTS - ALL FOUR PERIODS
+
+create_four_period_monthly_cycle <- function(climate_data, var_name, units) {
+  
+  # All four time periods
+  all_periods <- c("Historical (1981-2010)", "Near Future (2011-2040)", 
+                   "Mid Century (2041-2070)", "Late Century (2071-2100)")
+  
+  monthly_data_list <- list()
+  
+  for(period in all_periods) {
+    monthly_values <- c()
+    
+    for(month in 1:12) {
+      data_key <- paste(period, "Month", sprintf("%02d", month), sep = "_")
+      if(data_key %in% names(climate_data)) {
+        # Calculate spatial average
+        month_avg <- cellStats(climate_data[[data_key]], mean, na.rm = TRUE)
+        if(units == "mm/day" && month_avg > 1000) {
+          month_avg <- month_avg / 86400
+        }
+        monthly_values[month] <- month_avg
+      } else {
+        monthly_values[month] <- NA
+      }
+    }
+    
+    if(any(!is.na(monthly_values))) {
+      # Create shorter period names for legend
+      period_short <- case_when(
+        period == "Historical (1981-2010)" ~ "Historical",
+        period == "Near Future (2011-2040)" ~ "Near Future", 
+        period == "Mid Century (2041-2070)" ~ "Mid-Century",
+        period == "Late Century (2071-2100)" ~ "Late Century"
+      )
+      
+      monthly_data_list[[period]] <- data.frame(
+        Period = period_short,
+        Month = factor(month.name, levels = month.name),
+        Value = monthly_values
+      )
+    }
+  }
+  
+  if(length(monthly_data_list) == 0) {
+    cat("No monthly data found for", var_name, "\n")
+    return(NULL)
+  }
+  
+  # Combine all data
+  df <- do.call(rbind, monthly_data_list)
+  df <- df[!is.na(df$Value), ]
+  
+  # Set colors for the four periods (from cool historical to warm future)
+  period_colors <- c("Historical" = "#440154",      # Dark purple
+                     "Near Future" = "#31688E",      # Blue  
+                     "Mid-Century" = "#35B779",      # Green
+                     "Late Century" = "#FDE725")     # Yellow
+  
+  # Create the plot
+  p <- ggplot(df, aes(x = Month, y = Value, color = Period, group = Period)) +
+    geom_line(size = 1.5, alpha = 0.8) +
+    geom_point(size = 3, alpha = 0.9) +
+    scale_color_manual(values = period_colors) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 10, face = "bold"),
+      axis.text.y = element_text(size = 10),
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14, margin = margin(b = 15)),
+      plot.subtitle = element_text(hjust = 0.5, size = 11, color = "gray40", margin = margin(b = 15)),
+      legend.title = element_text(face = "bold", size = 11),
+      legend.text = element_text(size = 10),
+      legend.position = "right",
+      panel.grid.minor.x = element_blank(),
+      panel.grid.major.x = element_line(color = "grey92", size = 0.5),
+      panel.grid.major.y = element_line(color = "grey92", size = 0.5),
+      axis.title = element_text(face = "bold", size = 11),
+      plot.margin = margin(15, 15, 15, 15)
+    ) +
+    labs(
+      title = paste("Climate Change Impact:", var_name, "Annual Cycle"),
+      subtitle = "Togo Country Average - RCP8.5 Scenario",
+      x = "Month",
+      y = paste("Mean", units),
+      color = "Time Period"
+    ) +
+    guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))
+  
+  # Add subtle background highlight for wet/dry seasons if precipitation
+  if(units == "mm/day") {
+    # Highlight dry season (Nov-Mar) and wet season (May-Sep)
+    p <- p +
+      annotate("rect", xmin = 0.5, xmax = 3.5, ymin = -Inf, ymax = Inf, 
+               alpha = 0.1, fill = "orange") +  # Dry season
+      annotate("rect", xmin = 4.5, xmax = 9.5, ymin = -Inf, ymax = Inf, 
+               alpha = 0.1, fill = "blue") +    # Wet season
+      annotate("text", x = 2, y = max(df$Value) * 0.95, label = "Dry Season", 
+               size = 3, alpha = 0.7, fontface = "italic") +
+      annotate("text", x = 7, y = max(df$Value) * 0.95, label = "Wet Season", 
+               size = 3, alpha = 0.7, fontface = "italic")
+  }
+  
+  return(p)
+}
+
+# Create the four-period comparison plots
+cat("Creating 4-period precipitation annual cycle...\n")
+pr_four_periods <- create_four_period_monthly_cycle(pr_climate, "Precipitation", "mm/day")
+if(!is.null(pr_four_periods)) print(pr_four_periods)
+
+cat("Creating 4-period temperature annual cycle...\n")
+temp_four_periods <- create_four_period_monthly_cycle(tas_climate, "Temperature", "°C")
+if(!is.null(temp_four_periods)) print(temp_four_periods)
+
+# Save the new comparison plots
+ggsave("togo_precipitation_4periods_cycle.png", pr_four_periods, 
+       width = 12, height = 8, dpi = 300, bg = "white")
+ggsave("togo_temperature_4periods_cycle.png", temp_four_periods, 
+       width = 12, height = 8, dpi = 300, bg = "white")
+
+# Create a summary statistics table
+create_climate_summary <- function(climate_data, var_name, units) {
+  
+  periods <- c("Historical (1981-2010)", "Near Future (2011-2040)", 
+               "Mid Century (2041-2070)", "Late Century (2071-2100)")
+  
+  summary_list <- list()
+  
+  for(period in periods) {
+    annual_key <- paste(period, "Annual", sep = "_")
+    if(annual_key %in% names(climate_data)) {
+      annual_mean <- cellStats(climate_data[[annual_key]], mean, na.rm = TRUE)
+      if(units == "mm/day" && annual_mean > 1000) {
+        annual_mean <- annual_mean / 86400
+      }
+      
+      period_short <- gsub(" \\(.*\\)", "", period)
+      summary_list[[period]] <- data.frame(
+        Period = period_short,
+        Annual_Mean = round(annual_mean, 2),
+        Units = units
+      )
+    }
+  }
+  
+  summary_df <- do.call(rbind, summary_list)
+  return(summary_df)
+}
+
+# Create summary tables
+cat("\nClimate Summary Statistics:\n")
+pr_summary <- create_climate_summary(pr_climate, "Precipitation", "mm/day")
+temp_summary <- create_climate_summary(tas_climate, "Temperature", "°C")
+
+cat("PRECIPITATION (mm/day):\n")
+print(pr_summary)
+cat("\nTEMPERATURE (°C):\n") 
+print(temp_summary)
+
+cat("\n=== ENHANCED ANNUAL CYCLE PLOTS COMPLETE ===\n")
+cat("Created:\n")
+cat("✓ 4-period precipitation annual cycle with seasonal highlights\n")
+cat("✓ 4-period temperature annual cycle\n")
+cat("✓ Climate summary statistics\n")
+cat("✓ All plots saved as high-resolution PNG files\n")
+
